@@ -1,6 +1,6 @@
 # agent-monitor
 
-A floating, always-on-top macOS panel that shows what your AI agents and background jobs are doing — across any project. It reads local files only (task cards, runner logs, Codex session logs, Claude Code status lines) plus optional localhost health checks: **no network calls, no AI, no tokens**.
+A floating, always-on-top panel for macOS and Windows that shows what your AI agents and background jobs are doing — across any project. It reads local files only (task cards, runner logs, Codex session logs, Claude Code status lines) plus optional localhost health checks: **no network calls, no AI, no tokens**.
 
 It was built while orchestrating one Claude Code orchestrator (W0) and several Codex/Claude workers (W1–W3) on a real project, and is project-agnostic: everything project-specific lives in one JSON config.
 
@@ -23,6 +23,39 @@ cp examples/minimal.config.json ~/.config/agent-monitor/config.json   # then edi
 ./start.sh                                       # or ./start.sh path/to/other-config.json
 ```
 Requirements: macOS 13+, Xcode command-line tools (`swiftc`), Python 3.9+. `start.sh` compiles `Panel.swift` to `~/.local/bin/agent-monitor-panel` when it changed and starts it; close the window to stop. The panel keeps **one** long-lived `status.py --serve` process (≈15 ms CPU per 2-s tick) and restarts it if it dies.
+
+## Windows
+The same panel runs on Windows 10/11, in the same three layouts (Studio, Mission Control, Paper, each light/dark/auto) and with the same data. The window is drawn by Edge WebView2, which is built into Windows, through [pywebview](https://pywebview.flowrl.com/). The UI lives in `windows/ui/` (HTML/CSS/JS ported from `Panel.swift`), and `windows/panel.py` hosts it and streams `status.py --serve` into it.
+
+**Install (once):**
+1. Install **Python 3.9+** from [python.org](https://www.python.org/downloads/) and tick **"Add python.exe to PATH"**.
+2. Download this repo (green **Code** button → *Download ZIP*, then unzip it), or `git clone` it.
+3. Double-click **`windows\install.bat`**. It installs `pywebview` and `psutil`, creates `%USERPROFILE%\.config\agent-monitor\config.json` from `examples\windows.config.json`, and adds an **Agent Monitor** shortcut to your Desktop and Start menu.
+4. Open that `config.json` in Notepad and set your project's `title`, `repo` and accounts (see the config reference below).
+
+**Run:** double-click **Agent Monitor** on the Desktop, or `windows\start.bat [path\to\config.json]`. The panel opens on the right edge of the screen and stays on top. Close it to stop. Starting it again replaces the running panel. **Ctrl+T** cycles layouts, **Ctrl+Shift+T** flips light/dark, and Auto follows Windows' app light/dark setting. The window's size and position, theme, and Workers drawer are remembered in `%APPDATA%\agent-monitor\`, along with the usage history.
+
+**Auto-discovery (on by default on Windows):** with no config at all, the panel shows your real work.
+- **Claude Code sessions** that are running: it finds each `claude` process, matches it to its transcript in `~/.claude/projects`, and shows the title, your last request, the to-do list as steps, recent tool calls, tokens, and "your turn" when Claude is waiting for you. A transcript written in the last 5 minutes without a visible process (desktop app, VS Code) also counts.
+- **`codex exec` jobs:** each is named after its brief or folder and shows the prompt it was given, its commands and results, and Codex's latest message. `--ephemeral` jobs are read from the log their output is redirected to.
+- **Live Codex sessions** in the Codex app or VS Code: any session log written in the last 10 minutes.
+- **Usage:** Codex comes from `~/.codex/sessions`, including plans that only have a weekly window (shown as "7d"). Claude comes from your status line: add the block from `windows/claude-statusline.py`, or call it, so the 5h and 7d numbers appear. Even without it, a "limit reached" is picked up from transcripts.
+- **Recently finished:** jobs and sessions that stop running move here, with the time they ended.
+- **Repository:** the git repo of the most recently active session.
+
+Set `"autoDiscover": false` to use only task cards and configured accounts, as on macOS. Everything you configure explicitly (`workers`, `codexAccounts`, `claudeAccounts`, `repo`…) still wins.
+
+**Windows notes:**
+- Config paths may use `~`, `%TEMP%`, `%USERPROFILE%` and forward or back slashes, e.g. `"progressDir": "%TEMP%/agent-progress"`. In JSON a backslash must be doubled (`"D:\\code\\app"`), so forward slashes are easier.
+- Running `codex exec` and `claude -p` workers are found with `psutil`. That covers `codex.exe`, `codex.js` under Node, the native `codex-…-windows-msvc.exe`, `claude.exe` and `claude.cmd`. Command lines are matched with forward slashes, so the default task patterns (`docs/tasks/…`) work unchanged. Optional overrides: `codexExecPattern`, `headlessClaudePattern`, `agentProcessNames`.
+- Claude Code background-agent transcripts on Windows are under `%TEMP%\claude\…\tasks\*.output`, so use `"claudeTaskOutputGlobs": ["%TEMP%/claude/*/*/tasks/*.output"]`.
+- Health URLs: prefer `http://127.0.0.1:3000` over `localhost`. Windows spends about 2 s on a refused `localhost` connection. Checks run in the background either way, so they never slow the panel.
+- Claude Code usage on the panel: use the Python status line, which needs no bash. In `%USERPROFILE%\.claude\settings.json`:
+  ```json
+  "statusLine": {"type": "command", "command": "python \"D:/path/to/agent-monitor/windows/claude-statusline.py\" \"C:/Users/<you>/AppData/Local/Temp/claude-status-main.json\""}
+  ```
+  Then set that account's `statusFile` to the same path.
+- Preview the UI in a browser without Python (demo data): run `python -m http.server` in the repo folder, then open `http://127.0.0.1:8000/windows/ui/index.html?layout=mission&mode=dark&open=workers`.
 
 ## Config reference (`examples/full.config.json` shows every key)
 | Key | Meaning |
@@ -71,7 +104,7 @@ Add to each account's `settings.json`:
 and use the same path as that account's `statusFile`.
 
 ## Files
-`Panel.swift` (SwiftUI panel) · `fonts/` · `status.py` (data, `--serve` streaming mode, `--config`) · `start.sh` · `bin/card.py` · `bin/claude-statusline.sh` · `examples/*.config.json`.
+`Panel.swift` (SwiftUI panel, macOS) · `windows/` (Windows panel: `panel.py`, `ui/`, `install.bat`, `start.bat`, `claude-statusline.py`) · `fonts/` · `status.py` (data, `--serve` streaming mode, `--config`) · `start.sh` · `bin/card.py` · `bin/claude-statusline.sh` · `examples/*.config.json`.
 
 ## Licence
 MIT — see [LICENSE](LICENSE).

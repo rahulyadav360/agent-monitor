@@ -12,7 +12,8 @@ p = argparse.ArgumentParser(); p.add_argument('dir'); p.add_argument('task'); p.
 for o in ('--title', '--summary', '--account', '--steps', '--total', '--waiting', '--tags'): p.add_argument(o)
 p.add_argument('--bad', action='store_true')
 a = p.parse_args(); os.makedirs(a.dir, exist_ok=True); path = os.path.join(a.dir, a.task + '.json'); now = int(time.time())
-try: c = json.load(open(path))
+try:
+    with open(path, encoding='utf-8-sig') as fh: c = json.load(fh)
 except Exception: c = {}
 c.setdefault('source', 'interactive'); c.setdefault('steps', []); c.setdefault('metrics', [])
 if a.title: c['title'] = a.title
@@ -41,4 +42,6 @@ elif a.cmd == 'done':
     c.update(active=False, status='done')
     for s in c['steps']: s['status'] = 'done'
 else: sys.exit('unknown command ' + a.cmd)
-tmp = path + '.tmp'; json.dump(c, open(tmp, 'w'), indent=1); os.replace(tmp, path)
+tmp = path + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as fh: json.dump(c, fh, indent=1)
+os.replace(tmp, path)  # atomic on macOS and Windows

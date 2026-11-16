@@ -1,0 +1,96 @@
+/* agent-monitor for Windows: layout primitives and per-layout surfaces. Colours come from themes.js (set inline / as variables). */
+
+/* Bundled fonts (fonts/, SIL OFL 1.1). Variable fonts declare their weight range. */
+@font-face { font-family: "Space Grotesk"; src: url("../../fonts/SpaceGrotesk.woff2") format("woff2"); font-weight: 300 700; font-display: block; }
+@font-face { font-family: "JetBrains Mono"; src: url("../../fonts/JetBrainsMono.woff2") format("woff2"); font-weight: 100 800; font-display: block; }
+@font-face { font-family: "Doto"; src: url("../../fonts/Doto.woff2") format("woff2"); font-weight: 100 900; font-display: block; }
+@font-face { font-family: "IBM Plex Mono"; src: url("../../fonts/IBMPlexMono-Regular.woff2") format("woff2"); font-weight: 400; font-display: block; }
+@font-face { font-family: "IBM Plex Mono"; src: url("../../fonts/IBMPlexMono-SemiBold.woff2") format("woff2"); font-weight: 600; font-display: block; }
+@font-face { font-family: "IBM Plex Mono"; src: url("../../fonts/IBMPlexMono-Bold.woff2") format("woff2"); font-weight: 700; font-display: block; }
+@font-face { font-family: "Barlow Semi Condensed"; src: url("../../fonts/BarlowSemiCondensed-Medium.woff2") format("woff2"); font-weight: 500; font-display: block; }
+@font-face { font-family: "Barlow Semi Condensed"; src: url("../../fonts/BarlowSemiCondensed-SemiBold.woff2") format("woff2"); font-weight: 600; font-display: block; }
+@font-face { font-family: "Barlow Semi Condensed"; src: url("../../fonts/BarlowSemiCondensed-Bold.woff2") format("woff2"); font-weight: 700; font-display: block; }
+@font-face { font-family: "Fraunces"; src: url("../../fonts/Fraunces.woff2") format("woff2"); font-weight: 100 900; font-display: block; }
+@font-face { font-family: "Source Sans 3"; src: url("../../fonts/SourceSans3.woff2") format("woff2"); font-weight: 200 900; font-display: block; }
+
+:root { --sys: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; --bg: #E6E4DD; --text: #141414; --scroll: #B9B5AC; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { background: var(--bg); color: var(--text); font: 13px/1.4 var(--sys); -webkit-font-smoothing: antialiased; overflow-x: hidden; overflow-y: auto;
+  user-select: none; cursor: default; }
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+#root { max-width: 100%; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0; cursor: pointer; text-align: inherit; }
+button:focus-visible, .click:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+mark { padding: 0 2px; border-radius: 3px; }
+
+/* flex helpers */
+.row { display: flex; flex-direction: row; align-items: center; min-width: 0; }
+.col { display: flex; flex-direction: column; min-width: 0; }
+.row.top { align-items: flex-start; }
+.row.base { align-items: baseline; }
+.wrap { flex-wrap: wrap; }
+.nowrap { white-space: nowrap; flex-shrink: 0; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.clip { overflow: hidden; }
+.g4 { gap: 4px; } .g6 { gap: 6px; } .g8 { gap: 8px; } .g10 { gap: 10px; } .g12 { gap: 12px; } .g16 { gap: 16px; } .g18 { gap: 18px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.one { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 100%; flex: 0 1 auto; }
+.clamp { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.rule { height: 1px; flex: 0 0 auto; }
+.row > .rule.grow { flex: 1 1 auto; }
+.mark { width: 14px; flex: 0 0 14px; text-align: center; }
+.click { cursor: pointer; }
+
+/* atoms */
+.led { display: inline-block; border-radius: 50%; flex: 0 0 auto; }
+.wdot { display: inline-block; border-radius: 2px; flex: 0 0 auto; }
+.ico { display: inline-flex; flex: 0 0 auto; align-self: center; }
+.ico svg { width: 100%; height: 100%; display: block; }
+.iconbtn { display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+.pill { display: inline-block; white-space: nowrap; flex: 0 0 auto; line-height: 1.25 !important; }
+.bar { position: relative; overflow: hidden; width: 100%; flex: 0 0 auto; }
+.bar > b { position: absolute; left: 0; top: 0; bottom: 0; transition: width .6s ease-in-out; }
+.bar > b.indet { width: 35%; animation: indet 1.6s linear infinite; }
+@keyframes indet { from { left: -40%; } to { left: 105%; } }
+.bar.seg { display: flex; gap: 2px; overflow: visible; }
+.bar.seg > i { flex: 1; display: block; }
+.spin { width: 12px; height: 12px; border: 2px solid; border-radius: 50%; animation: spin .8s linear infinite; flex: 0 0 auto; margin: 1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.graph { width: 100%; overflow: hidden; }
+.graph svg { display: block; }
+.spark { position: relative; width: 100%; height: 100%; }
+.spark svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.spark i { position: absolute; right: -2px; width: 4px; height: 4px; margin-top: -2px; border-radius: 50%; }
+.ring { position: relative; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; }
+.ring svg { position: absolute; inset: 0; width: 64px; height: 64px; }
+
+/* Studio: LCD blocks (dark, scanlines, thick bezel) and key-cap cards (ink border + solid drop) */
+.lcd { position: relative; border: 3px solid; border-radius: 14px; padding: 12px 14px; width: 100%; }
+.lcd::after { content: ""; position: absolute; inset: 0; border-radius: 11px; pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(255,255,255,0.03) 0 1px, transparent 1px 3px); }
+.keycard { position: relative; border: 2px solid; border-radius: 14px; padding: 12px 14px; width: 100%; margin-bottom: 6px;
+  box-shadow: 0 4px 0 0 var(--drop), 0 4px 0 2px var(--dropline); }
+.key { position: relative; border: 2px solid; border-radius: 10px; padding: 7px 4px; display: inline-flex; align-items: center; justify-content: center;
+  white-space: nowrap; overflow: visible; min-width: 0; box-shadow: 0 3px 0 0 var(--drop); transition: transform .06s; }
+.key:active { transform: translateY(2px); box-shadow: 0 1px 0 0 var(--drop); }
+
+/* Mission Control: ticker */
+.ticker { display: flex; height: 26px; align-items: stretch; overflow: hidden; }
+.ticker .live { display: flex; align-items: center; padding: 0 8px; flex: 0 0 auto; }
+.tk-view { flex: 1; overflow: hidden; position: relative; }
+.tk-track { position: absolute; top: 0; bottom: 0; left: 0; display: flex; align-items: center; white-space: nowrap; animation: tick linear infinite; }
+.tk-track > span { padding: 0 40px 0 8px; }
+@keyframes tick { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+.mc-pick > button { display: flex; justify-content: center; align-items: center; }
+.mc-pick > button.col { align-items: flex-start; }
+
+/* Paper: soft cards */
+.papercard { border: 1px solid; border-radius: 16px; padding: 14px 16px; width: 100%; overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tk-track, .bar > b.indet, .spin { animation: none; }
+  .bar > b { transition: none; }
+}

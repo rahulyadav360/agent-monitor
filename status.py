@@ -3,7 +3,16 @@
 Local files only (plus optional localhost health checks): no network, no AI, no tokens.
 All project-specific settings come from a JSON config (see README.md and examples/):
   --config <path>  or  $AGENT_MONITOR_CONFIG  or  ~/.config/agent-monitor/config.json"""
-import glob, json, os, re, subprocess, time, urllib.request
+import glob, json, os, re, subprocess, tempfile, time, urllib.request
+
+try:  # cross-platform process list (required on Windows; optional on macOS, where `ps` is the fallback)
+    import psutil
+except ImportError:
+    psutil = None
+
+WINDOWS = os.name == "nt"
+TMP = tempfile.gettempdir()  # /tmp on macOS/Linux, %TEMP% on Windows
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console flash for child processes on Windows
 
 # Every Claude session has its own scratchpad; runner logs and background-agent transcripts can be in any of them.
 import sys as _sys
@@ -15,7 +24,7 @@ def _load_config():
         path = _sys.argv[_sys.argv.index("--config") + 1]
     path = path or os.environ.get("AGENT_MONITOR_CONFIG") or os.path.expanduser("~/.config/agent-monitor/config.json")
     try:
-        with open(os.path.expanduser(path)) as fh:
+        with open(os.path.expanduser(path), encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
     except (OSError, ValueError):
         cfg = {}
@@ -24,7 +33,10 @@ def _load_config():
 
 
 CFG = _load_config()
-X = lambda p: os.path.expanduser(os.path.join(CFG["_dir"], p)) if p and not os.path.isabs(os.path.expanduser(p)) else os.path.expanduser(p or "")
+def X(p):
+    """Config path -> absolute path: ~ and environment variables (%TEMP%, %USERPROFILE%, $HOME) expanded, relative to the config's folder."""
+    p = os.path.expandvars(os.path.expanduser(p or ""))
+    return os.path.join(CFG["_dir"], p) if p and not os.path.isabs(p) else p
 LOG_DIR_GLOBS = [X(g) for g in CFG.get("runnerLogDirGlobs", [])]          # folders holding "<task>.log" runner logs
 CLAUDE_TASKS_GLOBS = [X(g) for g in CFG.get("claudeTaskOutputGlobs", [])]  # Claude Code background agent transcripts
 
@@ -38,9 +50,22 @@ def find_log(name):
     return max(hits, key=os.path.getmtime) if hits else ""
 REPO = X(CFG.get("repo", ""))                                   # git repo whose changes / task branches are shown ("" = none)
 WORKTREES = X(CFG.get("worktreesDir", os.path.join(os.path.dirname(REPO), os.path.basename(REPO) + "-worktrees") if REPO else ""))
-PROGRESS = X(CFG.get("progressDir", "/tmp/agent-progress"))   # one JSON card per task (README: card format)
+PROGRESS = X(CFG.get("progressDir", os.path.join(TMP, "agent-progress")))   # one JSON card per task (README: card format)
 # Codex accounts: {"label": "Codex-A (worker)", "home": "~/.codex", "runnerAlias": "rahul", "short": "Codex-A"}
 CODEX = CFG.get("codexAccounts", [])
+# Auto-discovery (default on Windows): show running Claude Code sessions, Codex jobs and usage with no task cards and
+# almost no config. Anything configured explicitly still wins.
+AUTO = bool(CFG.get("autoDiscover", WINDOWS))
+CLAUDE_HOME = X(CFG.get("claudeHome", os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+if AUTO:
+    if not CODEX and os.path.isdir(os.path.expanduser("~/.codex")):
+        CODEX = [{"label": "Codex", "home": "~/.codex", "runnerAlias": "codex", "short": "Codex"}]
+    if "claudeAccounts" not in CFG:
+        CFG["claudeAccounts"] = [{"label": "Claude", "statusFile": os.path.join(TMP, "agent-monitor-claude-status.json")}]
+    if "workers" not in CFG:
+        CFG["workers"] = [["Claude", "W0"], ["Codex", "W1"]]
+    if "claudeTaskOutputGlobs" not in CFG:
+        CLAUDE_TASKS_GLOBS = [os.path.join(TMP, "claude", "*", "*", "tasks", "*.output")]
 HOMES = {a["label"]: X(a["home"]) for a in CODEX}
 NOW = time.time()
 PHASES = ["Explore", "Build", "Verify", "Handoff"]
@@ -48,9 +73,80 @@ PHASES = ["Explore", "Build", "Verify", "Handoff"]
 
 def sh(cmd):
     try:
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3).stdout
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3, creationflags=NO_WINDOW).stdout
     except Exception:
         return ""
+
+
+def git(*args):
+    """git in the configured repo, without a shell (same on macOS and Windows). Never takes locks."""
+    if not REPO:
+        return ""
+    try:
+        return subprocess.run(["git", "--no-optional-locks", "-C", REPO, *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=3, creationflags=NO_WINDOW).stdout or ""
+    except Exception:
+        return ""
+
+
+def _etime(s):
+    """ps etime '[[dd-]hh:]mm:ss' -> seconds."""
+    try:
+        parts = [int(x) for x in re.split(r"[-:]", s)]
+    except ValueError:
+        return 0
+    return sum(p * mu for p, mu in zip(reversed(parts), [1, 60, 3600, 86400]))
+
+
+# A running `codex exec …`: plain `codex exec` on macOS; on Windows also `codex.js exec`, `codex.exe exec`, `codex-x86_64-pc-windows-msvc.exe exec`.
+CODEX_EXEC = CFG.get("codexExecPattern", r"codex[^/\s\"']*[\"']?\s+exec\b")
+# A headless Claude worker: `claude -p …` (claude.exe / claude.cmd / node …/claude-code/cli.js on Windows).
+CLAUDE_P = CFG.get("headlessClaudePattern", r"claude(?:\.exe|\.cmd|-code/cli\.js)?[\"']?\s+(?:-p|--print)\b")
+
+
+_PROCS = {"t": -1, "v": []}
+# Reading a command line is slow on Windows (~2 s for every process), so only likely agent processes are read:
+# the process name must match this (codex.exe, codex-x86_64-….exe, claude.exe, node.exe, bun.exe, …).
+AGENT_PROC_NAMES = re.compile(CFG.get("agentProcessNames", r"codex|claude|node|bun|deno|python|pwsh|powershell|bash|sh\b|zsh"), re.I)
+
+
+def _proc_table():
+    """All candidate agent processes with their command lines, read once per tick (psutil)."""
+    if _PROCS["t"] == NOW:
+        return _PROCS["v"]
+    me, out = os.getpid(), []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            if p.info["pid"] == me or not AGENT_PROC_NAMES.search(p.info.get("name") or ""):
+                continue
+            cl = p.cmdline()
+            if not cl:
+                continue
+            out.append({"pid": p.info["pid"], "secs": max(0, int(NOW - p.create_time())), "cmd": " ".join(cl).replace("\\", "/"),
+                        "name": (p.info.get("name") or "").lower(), "env": (lambda p=p: p.environ()), "cwd": (lambda p=p: p.cwd())})
+        except (psutil.Error, OSError):
+            continue
+    _PROCS["t"], _PROCS["v"] = NOW, out
+    return out
+
+
+def procs(pattern):
+    """Processes whose command line matches `pattern`: [{"pid", "secs" (running time), "cmd", "env"()}].
+    Command lines use forward slashes on every OS, so the config's task patterns work unchanged on Windows."""
+    rx, out = re.compile(pattern), []
+    if psutil:
+        for p in _proc_table():
+            if rx.search(p["cmd"]):
+                out.append(p)
+        return out
+    for line in sh("ps -axww -o pid=,etime=,command=").splitlines():  # macOS fallback without psutil
+        f = line.split(None, 2)
+        if len(f) < 3 or not f[0].isdigit() or not rx.search(f[2]):
+            continue
+        pid = f[0]
+        out.append({"pid": int(pid), "secs": _etime(f[1]), "cmd": f[2],
+                    "env": (lambda pid=pid: dict(re.findall(r"(?:^|\s)(\w+)=(\S+)", sh(f"ps eww -o command= -p {pid}"))))})
+    return out
 
 
 def tail(path, n=4000):
@@ -65,7 +161,7 @@ def tail(path, n=4000):
 
 def _titles():
     try:
-        with open(X(CFG.get("titlesFile", "titles.json"))) as fh:
+        with open(X(CFG.get("titlesFile", "titles.json")), encoding="utf-8-sig") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -167,6 +263,14 @@ def session_details(f):
                     except Exception:
                         continue
                     p = j.get("payload", {})
+                    if p.get("name") == "update_plan":  # Codex's own step list: real subtasks with status
+                        try:
+                            plan = json.loads(p.get("arguments") or "{}").get("plan") or []
+                            m = {"completed": "done", "in_progress": "active"}
+                            st["plan"] = [{"title": str(x.get("step", ""))[:70], "status": m.get(x.get("status"), "pending")} for x in plan if isinstance(x, dict)][:10]
+                        except (ValueError, AttributeError):
+                            pass
+                        continue
                     c = clean_cmd(p.get("input") or p.get("arguments") or "")
                     if c is None:
                         continue
@@ -198,7 +302,7 @@ def session_details(f):
     except OSError:
         return d
     d["commands"] = len(calls) + st.get("dropped", 0)
-    d["edits"], d["phase"] = st.get("edits", 0), st.get("phase", 0)
+    d["edits"], d["phase"], d["plan"] = st.get("edits", 0), st.get("phase", 0), st.get("plan", [])
     stamps = [c["t"] for c in calls if c["t"]]
     d["lastActive"] = int(NOW - max(stamps)) if stamps else 0
     for c in calls[-7:][::-1]:
@@ -250,10 +354,10 @@ def auto_metrics(name):
         return hit[1]
     m = []
     branch = f"task/{name}"
-    n = sh(f"git --no-optional-locks -C '{REPO}' rev-list --count main..{branch} 2>/dev/null").strip() if REPO else ""
+    n = git("rev-list", "--count", f"main..{branch}").strip()
     if n.isdigit():
         m.append({"label": "Commits on task branch", "done": float(n), "total": None, "kind": "", "rate": "", "left": ""})
-        files = sh(f"git --no-optional-locks -C '{REPO}' diff --name-only main...{branch} 2>/dev/null").split()
+        files = git("diff", "--name-only", f"main...{branch}").split()
         m.append({"label": "Files changed", "done": float(len(files)), "total": None, "kind": "", "rate": "", "left": ""})
     wt = os.path.join(WORKTREES, name) if WORKTREES else ""
     if wt and os.path.isdir(wt):
@@ -304,12 +408,16 @@ def codex_short(alias):
 
 def running():
     out = []
-    for line in sh("pgrep -f 'codex exec' | xargs -I{} ps -o pid=,etime=,command= -p {}").splitlines():
-        pid = line.split()[0] if line.split() else ""
+    for pr in procs(CODEX_EXEC):
+        line = pr["cmd"]
         m = re.search(CFG.get("codexTaskPattern", r"complete (\S+\.md)"), line)
-        if not m:
+        if m:
+            name = os.path.basename(m.group(1))[:-3]
+        elif AUTO:  # no configured pattern matched: name the job after the brief it was given, else its folder
+            m2 = re.findall(r"([^\s\"'/:]+)\.md\b", line)
+            name = m2[-1] if m2 else "codex-" + os.path.basename(_cwd(pr) or "job").replace(" ", "-")
+        else:
             continue
-        name = os.path.basename(m.group(1))[:-3]
         if any(t["key"] == name for t in out):
             continue
         log = find_log(name)
@@ -320,23 +428,29 @@ def running():
         except OSError:
             accts = []
         # The process environment is authoritative for the account (CODEX_HOME), logs are a fallback.
-        env = sh(f"ps eww -o command= -p {pid}") if pid.isdigit() else ""
-        home = re.search(r"CODEX_HOME=(\S+)", env)
+        try:
+            home = (pr["env"]() or {}).get("CODEX_HOME", "")
+        except Exception:
+            home = ""
         if home:
-            hp = os.path.realpath(os.path.expanduser(home.group(1).rstrip("/")))
+            hp = os.path.normcase(os.path.realpath(os.path.expanduser(home.rstrip("/\\"))))
             for a in CODEX:
-                if os.path.realpath(X(a["home"])) == hp:
+                if os.path.normcase(os.path.realpath(X(a["home"]))) == hp:
                     accts.append(a.get("runnerAlias", a["label"]))
         num, title = pretty(name)
-        parts = [int(x) for x in re.split(r"[-:]", line.split()[1])]
-        secs = sum(p * mu for p, mu in zip(reversed(parts), [1, 60, 3600, 86400]))
-        sd = session_details(session_for(name))
+        secs = pr["secs"]
+        sess = session_for(name)
+        sd = session_details(sess)
+        if AUTO and (not sess or os.path.getmtime(sess) < NOW - secs - 60):  # `--ephemeral` jobs keep no session: read their output log
+            sess = ""
+            xl = _redirect_log(name) or find_log(name)
+            sd = exec_log_details(xl) if xl else {"commands": 0, "tokens": 0, "last": "", "recent": [], "phase": 0, "edits": 0, "lastActive": 0}
         task = {"summary": summary_for(num), "key": name, "id": num, "title": title, "account": codex_short(accts[-1] if accts else ""),
                 "elapsed": secs, "steps": [], "note": "", "commands": sd["commands"], "tokens": sd["tokens"], "edits": sd["edits"],
                 "recent": sd["recent"], "lastActive": sd["lastActive"], "estimated": True,
                 "failovers": len(re.findall(r"hit its limit", txt))}
         try:
-            with open(os.path.join(PROGRESS, name + ".json")) as fh:
+            with open(os.path.join(PROGRESS, name + ".json"), encoding="utf-8-sig") as fh:
                 p = json.load(fh)
             task["steps"], task["note"] = with_eta(p.get("steps", []), str(p.get("note", ""))[:200])
             task["estimated"] = False
@@ -347,15 +461,29 @@ def running():
         except Exception:
             ph = sd["phase"]
             task["steps"] = [{"title": n, "status": "done" if i < ph else "active" if i == ph else "pending"} for i, n in enumerate(PHASES)]
+            if sd.get("plan"):  # Codex's own plan beats the guessed phases
+                task["steps"], task["estimated"], task["stepsFrom"] = sd["plan"], False, "todos"
         if not task.get("metrics"):
             task["metrics"] = auto_metrics(name)
         if not task["note"]:
             task["note"] = sd["last"][:200]
+        if AUTO and not num:  # auto-found job: name it after its folder and brief, show what it was asked to do
+            proj = os.path.basename(_cwd(pr).rstrip("/\\")) or "Codex"
+            task["title"] = f"{proj} · {name.replace('_', ' ')}"[:80]
+            ask = _codex_prompt(line, _cwd(pr))
+            task["summary"] = (f"Asked: {ask}" if ask else f"Codex job in {proj}")[:160]
+            task["tags"] = [proj[:20]]
+            task["_session"] = sess
+            if not task["note"]:
+                task["note"] = "Codex is working (no commands logged yet)"
         out.append(task)
+    if AUTO:
+        out += claude_sessions(out)
+        out += codex_live_sessions(out)
     # Headless Claude workers (`claude -p "... docs/tasks/NNN-x.md ..."`): shown even before they write a card.
-    for line in sh("pgrep -fl 'claude -p'").splitlines():
-        m = re.search(CFG.get("headlessTaskPattern", r"docs/tasks/(\d{3}-[\w-]+)\.md"), line)
-        if not m or "pgrep" in line:
+    for pr in ([] if AUTO else procs(CLAUDE_P)):  # in auto mode they appear as Claude sessions instead
+        m = re.search(CFG.get("headlessTaskPattern", r"docs/tasks/(\d{3}-[\w-]+)\.md"), pr["cmd"])
+        if not m:
             continue
         name = m.group(1)
         if any(t["key"] == name for t in out):
@@ -370,7 +498,7 @@ def running():
     # Interactive Codex sessions do not run under `codex exec`.
     for path in glob.glob(os.path.join(PROGRESS, '*.json')):
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 p = json.load(fh)
             if p.get('source') != 'interactive' or not p.get('active'):
                 continue
@@ -396,12 +524,390 @@ def running():
     return out
 
 
+# ---------------------------------------------------------------- auto-discovery: Claude Code sessions and live Codex sessions
+
+
+def _cwd(pr):
+    try:
+        return pr["cwd"]() if "cwd" in pr else ""
+    except Exception:
+        return ""
+
+
+def _codex_prompt(line, cwd):
+    """The task text given to `codex exec`: what follows the working-folder option, else the last part of the command."""
+    c = cwd.replace("\\", "/").rstrip("/")
+    if c and f"-C {c} " in line:
+        return line.split(f"-C {c} ", 1)[1].strip()
+    m = re.search(r"\bexec\b.*?\s([A-Z][^-].{10,})$", line)
+    return m.group(1).strip() if m else ""
+
+
+def _redirect_log(name):
+    """Where a `codex exec` job's output is redirected (`… > ~/.codex-tools/run3.log`), read from its parent shell's command line."""
+    for p in _proc_table() if psutil else []:
+        if name not in p["cmd"]:
+            continue
+        for m in re.finditer(r"(?<![0-9&])>>?\|?\s*['\"]?([^\s'\";|&<>]+)", p["cmd"]):
+            f = m.group(1)
+            if f.startswith("/dev/") or not re.search(r"\.(log|txt|out)$", f, re.I):
+                continue
+            f = re.sub(r"^/([a-zA-Z])/", r"\1:/", f)  # Git Bash /c/Users/... -> C:/Users/...
+            f = os.path.expandvars(os.path.expanduser(f))
+            if not os.path.isabs(f):
+                f = os.path.join(_cwd(p) or "", f)
+            if os.path.isfile(f):
+                return f
+    return ""
+
+
+_XL = {}  # codex exec text log -> parsed state
+
+
+def exec_log_details(f):
+    """Commands, results, Codex's latest message and tokens from a `codex exec` text log (its stdout/stderr)."""
+    st = _XL.setdefault(f, {"off": 0, "calls": [], "last": "", "tokens": 0, "phase": 0, "edits": 0, "mode": "", "n": 0, "buf": []})
+    try:
+        with open(f, "rb") as fh:
+            fh.seek(st["off"])
+            chunk = fh.read(32 * 1024 * 1024)
+    except OSError:
+        chunk = b""
+    end = chunk.rfind(b"\n") + 1
+    st["off"] += end
+    t = os.path.getmtime(f) if os.path.exists(f) else NOW
+    for raw in chunk[:end].decode("utf-8", "replace").splitlines():
+        s = raw.rstrip()
+        head = s.strip()
+        if s in ("exec", "codex", "user", "thinking", "tokens used", "file update", "apply_patch"):
+            if st["mode"] == "codex" and st["buf"]:
+                st["last"] = re.sub(r"\s+", " ", " ".join(st["buf"])).strip()[:240]
+            st["mode"], st["buf"] = s, []
+            if s in ("file update", "apply_patch"):
+                st["edits"] += 1
+            continue
+        if st["mode"] == "exec" and not st["buf"] and head:
+            cmd = re.sub(r"\s+in\s+[A-Za-z]:\\.*$|\s+in\s+/\S*$", "", head)
+            shell = re.match(r"^\"?[^\"]*?\b(powershell|pwsh|bash|cmd)(?:\.exe)?\"?\s+(?:-Command|-c|/c)\s+", cmd, re.I)
+            cmd = (cmd[shell.end():] if shell else cmd).strip().strip("\"").replace("\\\\", "\\")
+            script = cmd in ("@'", "@\"", "")
+            if script:  # a here-string script: name it after its first line
+                cmd = ("PowerShell" if shell and shell.group(1).lower() in ("powershell", "pwsh") else "Script") + " script"
+            st["calls"].append({"cmd": cmd[:140], "state": "running", "t": t, "secs": -1, "script": script})
+            del st["calls"][:-60]
+            st["n"] += 1
+            st["phase"] = max(st["phase"], phase_of(cmd))
+            st["buf"].append(head)
+            continue
+        if st["mode"] == "exec" and st["calls"] and st["calls"][-1].get("script") and head and not head.startswith("#"):
+            c = st["calls"][-1]
+            c["cmd"], c["script"] = f"{c['cmd']} · {head}"[:140], False
+            st["phase"] = max(st["phase"], phase_of(head))
+            continue
+        m = re.match(r"\s*(succeeded|exited (-?\d+)) in (\d+)ms", s)
+        if m and st["calls"] and st["calls"][-1]["state"] == "running":
+            c = st["calls"][-1]
+            c["state"] = "ok" if m.group(1) == "succeeded" or m.group(2) == "0" else "fail"
+            c["secs"] = int(m.group(3)) / 1000
+            st["mode"] = ""
+            continue
+        if st["mode"] == "codex" and head:
+            st["buf"].append(head)
+        elif st["mode"] == "tokens used" and head:
+            n = re.sub(r"[^\d]", "", head)
+            if n:
+                st["tokens"] = int(n)
+    last = st["last"]
+    if st["mode"] == "codex" and st["buf"]:
+        last = re.sub(r"\s+", " ", " ".join(st["buf"])).strip()[:240]
+    recent = [{"cmd": c["cmd"], "state": c["state"], "secs": round(c["secs"], 1) if c["state"] != "running" else round(NOW - c["t"], 1)}
+              for c in st["calls"][-7:][::-1]]
+    return {"commands": st["n"], "tokens": st["tokens"], "last": last, "recent": recent, "phase": st["phase"],
+            "edits": st["edits"], "lastActive": int(NOW - t) if os.path.exists(f) else 0}
+
+
+def _claude_dir(cwd):
+    """Claude Code keeps each project's transcripts in ~/.claude/projects/<cwd with every non-alphanumeric char as '-'>."""
+    return os.path.join(CLAUDE_HOME, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd.rstrip("/\\")))
+
+
+def _iso(s):
+    try:
+        return time.mktime(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+    except Exception:
+        return None
+
+
+_CT = {}  # transcript path -> parsed state, read incrementally (only new complete lines each tick)
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def _tool_desc(name, inp):
+    inp = inp if isinstance(inp, dict) else {}
+    for k in ("description", "command", "file_path", "pattern", "url", "query", "prompt", "skill", "subject"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            v = re.sub(r"\s+", " ", v).strip()
+            if k == "file_path":
+                v = os.path.basename(v)
+            return f"{name} · {v}"[:140]
+    return name[:140]
+
+
+def _new_ct():
+    return {"off": 0, "title": "", "first": "", "last_prompt": "", "calls": [], "results": {}, "todos": [], "tasks": {},
+            "tokens": 0, "t0": None, "t1": None, "text": "", "waiting": False, "edits": 0, "limit": None, "cwd": "", "n": 0}
+
+
+def claude_transcript(path):
+    """Title, latest request, to-do steps, tool calls, tokens and timing from a Claude Code transcript (.jsonl)."""
+    st = _CT.setdefault(path, _new_ct())
+    try:
+        size = os.path.getsize(path)
+        if size < st["off"]:  # file was rewritten: read it again from the start
+            st.clear()
+            st.update(_new_ct())
+        with open(path, "rb") as fh:
+            if st["off"] == 0 and size > 16 * 1024 * 1024:
+                # Long-running sessions grow to hundreds of MB: the latest 8 MB holds the current title, asks and work.
+                fh.seek(size - 8 * 1024 * 1024)
+                fh.readline()  # skip the partial line
+                st["off"] = fh.tell()
+            else:
+                fh.seek(st["off"])
+            chunk = fh.read(min(size - st["off"], 64 * 1024 * 1024))
+    except OSError:
+        return st
+    end = chunk.rfind(b"\n") + 1
+    st["off"] += end
+    for line in chunk[:end].decode("utf-8", "replace").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain"):
+            continue  # a subagent's turn, not the main conversation
+        typ, ts = d.get("type"), _iso(d.get("timestamp"))
+        if ts and typ in ("user", "assistant"):
+            st["t0"] = st["t0"] or ts
+            st["t1"] = ts
+        if d.get("cwd"):
+            st["cwd"] = d["cwd"]
+        if typ == "ai-title" and d.get("aiTitle"):
+            st["title"] = str(d["aiTitle"])
+        elif typ == "summary" and d.get("summary") and not st["title"]:
+            st["title"] = str(d["summary"])
+        elif typ == "last-prompt" and d.get("lastPrompt") and not st["first"]:
+            st["last_prompt"] = str(d["lastPrompt"])  # only until real messages are seen: this record can lag behind them
+        elif typ == "user":
+            c = (d.get("message") or {}).get("content")
+            parts = [{"type": "text", "text": c}] if isinstance(c, str) else (c if isinstance(c, list) else [])
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "tool_result":
+                    st["results"][part.get("tool_use_id")] = (bool(part.get("is_error")), ts)
+                elif part.get("type") == "text" and not d.get("isMeta"):
+                    t = str(part.get("text", "")).strip()
+                    if t and not t.startswith("<") and not t.startswith("[Request interrupted"):
+                        st["first"] = st["first"] or t
+                        st["last_prompt"] = t
+                        st["waiting"] = False
+                        st.setdefault("asks", []).append(re.sub(r"\s+", " ", t)[:70])
+                        del st["asks"][:-8]
+        elif typ == "assistant":
+            msg = d.get("message") or {}
+            u = msg.get("usage") or {}
+            st["tokens"] += int(u.get("output_tokens") or 0) + int(u.get("input_tokens") or 0)
+            if isinstance(d.get("quotaLimits"), dict):
+                q = d["quotaLimits"]
+                st["limit"] = (q.get("status"), q.get("resetsAt"), q.get("rateLimitType"))
+            uses = False
+            for part in msg.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and str(part.get("text", "")).strip():
+                    st["text"] = re.sub(r"\s+", " ", part["text"]).strip()[:240]
+                elif part.get("type") == "tool_use":
+                    uses = True
+                    name, inp = part.get("name", ""), part.get("input") or {}
+                    st["n"] += 1
+                    st["calls"].append({"id": part.get("id"), "cmd": _tool_desc(name, inp), "t": ts})
+                    del st["calls"][:-60]
+                    st["edits"] += name in EDIT_TOOLS
+                    if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+                        st["todos"] = [{"title": str(t.get("content") or t.get("activeForm") or "")[:70], "status": str(t.get("status", "pending"))}
+                                       for t in inp["todos"] if isinstance(t, dict)]
+                    elif name == "TaskCreate" and inp.get("subject"):
+                        st["tasks"][str(len(st["tasks"]) + 1)] = {"title": str(inp["subject"])[:70], "status": "pending"}
+                    elif name == "TaskUpdate" and str(inp.get("taskId", "")) in st["tasks"]:
+                        t = st["tasks"][str(inp["taskId"])]
+                        if inp.get("status"):
+                            t["status"] = str(inp["status"])
+                        if inp.get("subject"):
+                            t["title"] = str(inp["subject"])[:70]
+            st["waiting"] = msg.get("stop_reason") == "end_turn" and not uses
+        if len(st["results"]) > 400:
+            keep = {c["id"] for c in st["calls"]}
+            st["results"] = {k: v for k, v in st["results"].items() if k in keep}
+    return st
+
+
+def _steps_of(st, waiting=False):
+    """The session's own to-do list (TodoWrite / TaskCreate) as steps; without one, its requests: earlier ones done, the latest in progress."""
+    raw = st["todos"] or [t for t in st["tasks"].values() if t["status"] != "deleted"]
+    m = {"completed": "done", "done": "done", "in_progress": "active", "active": "active"}
+    if raw:
+        return [{"title": t["title"], "status": m.get(t["status"], "pending")} for t in raw][:10], "todos"
+    asks = st.get("asks") or []
+    if not asks:
+        return [], ""
+    return [{"title": a, "status": "done" if i < len(asks) - 1 or waiting else "active"} for i, a in enumerate(asks)], "asks"
+
+
+def _live_claude_sessions():
+    """Claude Code's own registry of open sessions (~/.claude/sessions/<pid>.json): session id, folder, busy/idle, start time."""
+    out = []
+    for f in glob.glob(os.path.join(CLAUDE_HOME, "sessions", "*.json")):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
+            pid = int(d.get("pid") or 0)
+            if not pid or not d.get("sessionId") or (psutil and not psutil.pid_exists(pid)):
+                continue
+            hits = glob.glob(os.path.join(CLAUDE_HOME, "projects", "*", d["sessionId"] + ".jsonl"))
+            if hits:
+                out.append({"file": hits[0], "pid": pid, "cwd": d.get("cwd", ""), "status": d.get("status", ""),
+                            "started": float(d.get("startedAt") or 0) / 1000, "name": d.get("name", "")})
+        except (OSError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _nice_title(st, proj):
+    t = st["title"]
+    if t and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)+", t):  # slug-style title: "ribbon-masterplan-v10"
+        t = t.replace("-", " ").capitalize()
+    t = t or re.sub(r"\s+", " ", st["first"]).strip()
+    return (t or f"Claude session in {proj}")[:80]
+
+
+_CLAUDE_LIMIT = {"until": 0.0}  # a session was refused with "5-hour limit reached" until this time (from transcripts)
+
+
+def claude_sessions(already):
+    """Running Claude Code sessions: claude processes (matched to transcripts by working folder) plus any
+    transcript written in the last 5 minutes (Claude desktop app, VS Code, sessions without a visible process)."""
+    out, seen = [], set()
+    by_dir = {}
+    reg = _live_claude_sessions()  # exact: Claude Code's own list of open sessions
+    reg_pids = {r["pid"] for r in reg}
+    if psutil:
+        for pr in _proc_table():
+            if not re.match(r"claude(\.exe)?$", pr.get("name", "")) or "--type=" in pr["cmd"] or pr["pid"] in reg_pids:
+                continue  # the Claude desktop app's helper processes are not sessions
+            cwd = _cwd(pr)
+            d = cwd
+            while d:  # a session that moved into a subfolder keeps its transcripts under the folder it started in
+                if glob.glob(os.path.join(_claude_dir(d), "*.jsonl")):
+                    by_dir.setdefault(_claude_dir(d), []).append((pr, cwd))
+                    break
+                up = os.path.dirname(d.rstrip("/\\"))
+                d = "" if up == d.rstrip("/\\") else up
+    cands = [(r["file"], {"secs": int(NOW - r["started"]) if r["started"] else 0, "status": r["status"]}, r["cwd"]) for r in reg]
+    for d, plist in by_dir.items():
+        files = sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
+        for (pr, cwd), f in zip(sorted(plist, key=lambda x: x[0]["secs"]), files):  # newest process <-> newest transcript
+            cands.append((f, pr, cwd))
+    claimed = {c[0] for c in cands}
+    for f in glob.glob(os.path.join(CLAUDE_HOME, "projects", "*", "*.jsonl")):
+        try:
+            if f not in claimed and NOW - os.path.getmtime(f) < 300:
+                cands.append((f, None, ""))
+        except OSError:
+            pass
+    for f, pr, cwd in cands:
+        if f in seen:
+            continue
+        seen.add(f)
+        st = claude_transcript(f)
+        if not st["t1"]:
+            continue
+        cwd = cwd or st["cwd"] or ""
+        proj = os.path.basename(cwd.rstrip("/\\")) or os.path.basename(os.path.dirname(f))
+        if pr and pr.get("status"):  # registry status is authoritative: busy = working, anything else = your turn
+            st["waiting"] = pr["status"] != "busy"
+        steps, steps_from = _steps_of(st, st["waiting"])
+        recent = []
+        for c in st["calls"][-7:][::-1]:
+            res = st["results"].get(c["id"])
+            state = "running" if res is None else ("fail" if res[0] else "ok")
+            secs = (res[1] - c["t"]) if res and res[1] and c["t"] else (NOW - c["t"] if state == "running" and c["t"] else -1)
+            recent.append({"cmd": c["cmd"], "state": state, "secs": round(max(secs, 0), 1) if secs != -1 else -1})
+        try:
+            last = max(st["t1"], os.path.getmtime(f))
+        except OSError:
+            last = st["t1"]
+        idle = max(0, int(NOW - last))
+        if st["waiting"]:
+            note = "Waiting for your reply" + (f" · {st['text']}" if st["text"] else "")
+        else:
+            note = st["text"] or ("Working…" if idle < 60 else "")
+        lim = st["limit"]
+        if lim and lim[0] == "rejected" and lim[1]:
+            try:
+                if float(lim[1]) > NOW:
+                    _CLAUDE_LIMIT["until"] = max(_CLAUDE_LIMIT["until"], float(lim[1]))
+            except (TypeError, ValueError):
+                pass
+        tags = [proj[:20]] + (["needs you"] if st["waiting"] and idle > 30 else [])
+        ask = re.sub(r"\s+", " ", st["last_prompt"]).strip()
+        out.append({"key": "claude-" + os.path.basename(f)[:8], "id": "", "title": _nice_title(st, proj),
+                    "summary": (f"Last ask: {ask}" if ask else f"Claude Code in {proj}")[:160],
+                    "account": "Claude Code", "elapsed": pr["secs"] if pr else int(NOW - (st["t0"] or NOW)),
+                    "steps": steps, "note": note[:200], "metrics": [], "tags": tags,
+                    "commands": st["n"], "tokens": st["tokens"], "edits": st["edits"], "recent": recent,
+                    "lastActive": idle, "estimated": steps_from != "todos", "stepsFrom": steps_from, "failovers": 0, "_cwd": cwd, "_t": last})
+    return out
+
+
+def codex_live_sessions(already):
+    """Interactive Codex sessions (Codex app, VS Code, CLI) whose log was written in the last 10 minutes."""
+    out = []
+    taken = {t.get("_session") for t in already if t.get("_session")}
+    for home in HOMES.values():
+        for f in glob.glob(os.path.join(home, "sessions", "*", "*", "*", "*.jsonl")):
+            try:
+                if NOW - os.path.getmtime(f) > 600 or f in taken:
+                    continue
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    head = fh.readline()
+                meta = (json.loads(head).get("payload") or {}) if head.startswith("{") else {}
+            except (OSError, ValueError):
+                continue
+            sd = session_details(f)
+            cwd = str(meta.get("cwd") or "")
+            proj = os.path.basename(cwd.rstrip("/\\")) or "Codex"
+            ph = sd["phase"]
+            out.append({"key": "codex-" + os.path.basename(f)[-14:-6], "id": "", "title": f"{proj} · Codex session",
+                        "summary": f"Codex ({meta.get('source') or meta.get('originator') or 'session'}) in {cwd or proj}"[:160],
+                        "account": "Codex", "elapsed": int(NOW - (_iso(meta.get("timestamp")) or os.path.getctime(f))),
+                        "steps": sd.get("plan") or [{"title": n, "status": "done" if i < ph else "active" if i == ph else "pending"} for i, n in enumerate(PHASES)],
+                        "stepsFrom": "todos" if sd.get("plan") else "phases",
+                        "note": sd["last"][:200], "metrics": [], "tags": [proj[:20]], "commands": sd["commands"], "tokens": sd["tokens"],
+                        "edits": sd["edits"], "recent": sd["recent"], "lastActive": sd["lastActive"] or int(NOW - os.path.getmtime(f)),
+                        "estimated": not sd.get("plan"), "failovers": 0, "_cwd": cwd, "_t": os.path.getmtime(f)})
+    return out
+
+
 def queued():
     """Cards waiting to start: status 'queued' (waits on a condition) or 'blocked' (waits on the owner)."""
     out = []
     for path in glob.glob(os.path.join(PROGRESS, '*.json')):
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 p = json.load(fh)
             st = p.get('status')
             if st not in ('queued', 'blocked') or p.get('active'):
@@ -453,7 +959,7 @@ def finished():
                 continue
             seen.add(name)
             try:
-                with open(os.path.join(PROGRESS, name + ".json")) as fh:
+                with open(os.path.join(PROGRESS, name + ".json"), encoding="utf-8-sig") as fh:
                     if json.load(fh).get("active"):
                         continue  # paused/resuming task: it is shown in progress, not as finished
             except (OSError, ValueError):
@@ -468,7 +974,7 @@ def finished():
             mt = os.path.getmtime(path)
             if NOW - mt > 12 * 3600:
                 continue
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 p = json.load(fh)
             name = os.path.basename(path)[:-5]
             if p.get("active") or p.get("status") != "done" or "demo" in name:
@@ -484,6 +990,11 @@ def finished():
                          "_acct": str(p.get("account", ""))})
         except (OSError, ValueError, TypeError):
             continue
+    for d in _auto_done().get("done", []) if AUTO else []:  # auto-found jobs and sessions that ended
+        if NOW - d.get("t", 0) < 12 * 3600 and d.get("key") not in seen:
+            seen.add(d.get("key"))
+            rows.append({"id": "", "title": str(d.get("title", ""))[:80], "time": time.strftime("%H:%M", time.localtime(d["t"])),
+                         "ok": True, "_t": d["t"], "_acct": str(d.get("account", ""))})
     rows.sort(key=lambda r: -r["_t"])
     for r in rows:
         r.pop("_t", None)
@@ -514,6 +1025,9 @@ def usage():
                 pr, se, ts = rl.get("primary"), rl.get("secondary") or {}, str(d.get("timestamp", ""))
                 if pr and rl.get("limit_id", "codex") == "codex" and ts > latest:
                     latest = ts
+                    weekly_only = int(pr.get("window_minutes") or 300) >= 1440 and not se  # some plans have no 5-hour window
+                    if weekly_only:
+                        se = pr
                     p5, reset = float(pr.get("used_percent") or 0), int(pr.get("resets_at") or 0)
                     p7, reset7 = float(se.get("used_percent") or 0), int(se.get("resets_at") or 0)
         if reset and reset < NOW:
@@ -522,13 +1036,18 @@ def usage():
             p7 = 0.0
         alias = next((str(a.get("runnerAlias", "")).lower() for a in CODEX if a["label"] == label), "")
         l = [t for t, a in lim if a.lower() == alias]
-        res.append({"name": label, "tool": "Codex", "five": p5, "seven": p7, "resetIn": max(0, int(reset - NOW)) if reset else 0, "lastLimit": l[-1] if l else ""})
+        row = {"name": label, "tool": "Codex", "five": p5, "seven": p7, "resetIn": max(0, int(reset - NOW)) if reset else 0, "lastLimit": l[-1] if l else ""}
+        if latest and weekly_only:
+            row["win"] = "7d"  # the main number is the weekly window: the panel labels it 7d instead of 5h
+        if not latest:
+            row["unknown"] = True  # no usage reading in the last 8 h
+        res.append(row)
     # One status file per Claude account (each account's statusline.sh writes its own).
     # Claude accounts: {"label": "Claude-A (orchestrator)", "statusFile": "/tmp/claude-status-a.json", "limitLogGlobs": ["…/*w3*.log"]}
     claude = [(a["label"], X(a["statusFile"])) for a in CFG.get("claudeAccounts", [])]
     for i, (label, path) in enumerate(claude):
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 c = json.load(fh)
             rl = c.get("rate_limits", {})
             five, seven = rl.get("five_hour"), rl.get("seven_day") or {}
@@ -543,7 +1062,10 @@ def usage():
                 row.update(five=100.0, resetIn=hit, unknown=False)
             res.insert(i, row)
         except Exception:
-            res.insert(i, {"name": label, "tool": "Claude", "five": 0.0, "seven": 0.0, "resetIn": 0, "lastLimit": "", "age": -1, "unknown": True})
+            row = {"name": label, "tool": "Claude", "five": 0.0, "seven": 0.0, "resetIn": 0, "lastLimit": "", "age": -1, "unknown": True}
+            if AUTO and _CLAUDE_LIMIT["until"] > NOW:  # no status line yet, but a session was just refused at its limit
+                row.update(five=100.0, resetIn=int(_CLAUDE_LIMIT["until"] - NOW), unknown=False, age=0)
+            res.insert(i, row)
     return res
 
 
@@ -575,16 +1097,16 @@ def claude_limit_from_logs(label):
 
 def cached_usage(path=None, ttl=20):
     """Usage parsing is the slowest part; the panel refreshes every 2 s, so reuse it for 20 s."""
-    path = path or X(CFG.get("usageCacheFile", "/tmp/agent-monitor-usage.json"))
+    path = path or X(CFG.get("usageCacheFile", os.path.join(TMP, "agent-monitor-usage.json")))
     try:
         if NOW - os.path.getmtime(path) < ttl:
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 return json.load(fh)
     except (OSError, ValueError):
         pass
     res = usage()
     try:
-        with open(path + ".tmp", "w") as fh:
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(res, fh)
         os.replace(path + ".tmp", path)
     except OSError:
@@ -594,7 +1116,7 @@ def cached_usage(path=None, ttl=20):
 
 def repo_changes():
     areas = {}
-    for l in (sh(f"git --no-optional-locks -C '{REPO}' status --short") if REPO else "").splitlines():
+    for l in git("status", "--short").splitlines():
         parts = l[3:].strip().strip('"').split("/")
         key = "/".join(parts[:2]) if parts[0] in ("apps", "packages", "docs", "scripts") and len(parts) > 1 else parts[0]
         areas[key] = areas.get(key, 0) + 1
@@ -607,6 +1129,35 @@ def up(url):
         return True
     except Exception:
         return False
+
+
+_HEALTH = {}  # url -> up, kept fresh by a background thread in --serve mode
+
+
+def health_rows():
+    """Health checks run in parallel; in --serve mode a background thread keeps them fresh, so a slow or refused
+    port (Windows waits ~2 s on a refused localhost connection) never delays a tick."""
+    hs = CFG.get("health", [])
+    if not _HEALTH:
+        _check_health(hs)
+    return [{"label": h["label"], "up": _HEALTH.get(h["url"], False), "group": h.get("group", "")} for h in hs]
+
+
+def _check_health(hs):
+    from concurrent.futures import ThreadPoolExecutor
+    urls = list({h["url"] for h in hs})
+    if urls:
+        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as ex:
+            _HEALTH.update(zip(urls, ex.map(up, urls)))
+
+
+def _health_loop(every=5.0):
+    while True:
+        try:
+            _check_health(CFG.get("health", []))
+        except Exception:
+            pass
+        time.sleep(every)
 
 
 def _worker_defs():
@@ -703,7 +1254,7 @@ def _finish_events(since):
             mt = os.path.getmtime(path)
             if mt < since:
                 continue
-            with open(path) as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 p = json.load(fh)
             if p.get("active") or p.get("status") != "done":
                 continue
@@ -713,6 +1264,9 @@ def _finish_events(since):
                 ev[name] = (name, wid or (ev.get(name) or ("", ""))[1], True, mt)
         except (OSError, ValueError, TypeError):
             continue
+    for d in _auto_done().get("done", []) if AUTO else []:
+        if d.get("t", 0) >= since:
+            ev[d.get("key", "")] = (d.get("key", ""), worker_id(numbered(str(d.get("account", "")))), True, d["t"])
     _EVENTS["t"], _EVENTS["v"] = NOW, list(ev.values())
     return _EVENTS["v"]
 
@@ -771,18 +1325,78 @@ def snapshot():
     return _number_all(_snapshot())
 
 
+AUTO_DONE_FILE = os.path.join(TMP, "agent-monitor-auto-finished.json")
+
+
+def _auto_done():
+    try:
+        with open(AUTO_DONE_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _auto_track(run):
+    """Auto-found work that stops running (job ended, session closed) moves to Recently finished, at the time it was last seen."""
+    if not AUTO:
+        return
+    st = _auto_done()
+    live, done = st.get("live", {}), st.get("done", [])
+    cur = {t["key"]: {"title": t["title"], "account": t.get("account", ""), "t": NOW} for t in run}
+    ended = [k for k in live if k not in cur]
+    for k in ended:
+        v = live[k]
+        done = [d for d in done if d.get("key") != k]  # a session can finish several times: keep its latest finish only
+        done.append({"key": k, "title": v.get("title", k), "account": v.get("account", ""), "t": v.get("t", NOW)})
+    done = [d for d in done if NOW - d.get("t", 0) < 24 * 3600][-40:]
+    if ended or set(cur) != set(live) or NOW - max([v.get("t", 0) for v in live.values()] or [0]) > 60:
+        try:
+            with open(AUTO_DONE_FILE + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({"live": cur, "done": done}, fh)
+            os.replace(AUTO_DONE_FILE + ".tmp", AUTO_DONE_FILE)
+        except OSError:
+            pass
+
+
+def _auto_repo(run):
+    """No repo configured: show the git repo of the most recently active session's folder."""
+    global REPO
+    if not AUTO or CFG.get("repo"):
+        return
+    for t in sorted(run, key=lambda t: -(t.get("_t") or 0)):
+        c = t.get("_cwd") or ""
+        if c and os.path.exists(os.path.join(c, ".git")):
+            REPO = c
+            return
+    REPO = ""
+
+
 def _snapshot():
+    run = running()
+    if AUTO:  # most recently active first
+        run.sort(key=lambda t: t.get("lastActive", 0))
+    _auto_repo(run)
+    # Only ongoing work is shown: a task whose steps are all done (100 %) leaves "In progress" and moves to
+    # Recently finished; it comes back by itself when new work starts in it (e.g. you send that session a new request).
+    if CFG.get("hideCompleted", True):
+        run = [t for t in run if not (t.get("steps") and all(s.get("status") == "done" for s in t["steps"]))]
+    _auto_track(run)
+    for t in run:
+        for k in [k for k in t if k.startswith("_")]:
+            del t[k]
     return {
     "time": time.strftime("%H:%M:%S"),
-    "running": running(),
+    "running": run,
     "queued": queued(),
     "agents": claude_agents(),
     "finished": finished(),
     "accounts": cached_usage(),
-    "commit": sh(f"git --no-optional-locks -C '{REPO}' log -1 --format='%h · %s · %ar'").strip()[:90] if REPO else "",
+    "commit": git("log", "-1", "--format=%h · %s · %ar").strip()[:90],
+    "repo": os.path.basename(REPO.rstrip("/\\")) if REPO else "",
     "changes": repo_changes(),
     "title": CFG.get("title", "Agent monitor"),
-    "health": [{"label": h["label"], "up": up(h["url"]), "group": h.get("group", "")} for h in CFG.get("health", [])],
+    "health": health_rows(),
     }
 
 
@@ -800,6 +1414,10 @@ def serve(interval=2.0):
             _USAGE["v"], _USAGE["t"] = file_cached(), NOW
         return _USAGE["v"]
     cached_usage = mem_usage
+    if CFG.get("health"):
+        import threading
+        _check_health(CFG["health"])
+        threading.Thread(target=_health_loop, daemon=True).start()
     while True:
         NOW = time.time()
         try:
